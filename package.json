@@ -1,0 +1,24 @@
+{
+  "name": "kombolcha-smart-city",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Kombolcha Smart City portal - announcements, services and city map",
+  "scripts": {
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "node --watch server/index.js",
+    "dev:client": "npm --prefix client run dev",
+    "build": "npm --prefix client run build",
+    "start": "node server/index.js",
+    "seed": "node server/seed.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.8",
+    "express": "^5.3.0",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6"
+  }
+}
