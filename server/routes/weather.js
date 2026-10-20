@@ -5,9 +5,14 @@ const router = Router();
 
 const LATITUDE = Number(process.env.WEATHER_LAT) || 11.0849;
 const LONGITUDE = Number(process.env.WEATHER_LON) || 39.7392;
-const CACHE_SECONDS = Number(process.env.WEATHER_CACHE_SECONDS) || 600;
 const TIMEOUT_MS = Number(process.env.WEATHER_TIMEOUT_MS) || 8000;
 const ENABLED = process.env.WEATHER_ENABLED !== 'false';
+
+// Fresh responses are served for 15 minutes. If the provider is unavailable,
+// the last successful response can be served for up to 6 hours.
+export const WEATHER_CACHE_TTL_MS = 15 * 60 * 1000;
+export const WEATHER_STALE_TTL_MS = 6 * 60 * 60 * 1000;
+const RATE_LIMIT_FALLBACK_MS = 60 * 1000;
 
 export const WEATHER_SOURCE = Object.freeze({
   name: 'Open-Meteo',
@@ -49,9 +54,13 @@ export const WMO_DESCRIPTIONS = Object.freeze({
 });
 
 let cache = null;
+let inFlight = null;
+let rateLimitedUntil = 0;
 
 export function resetWeatherCache() {
   cache = null;
+  inFlight = null;
+  rateLimitedUntil = 0;
 }
 
 function toOffsetIso(localTime, offsetSeconds) {
@@ -153,7 +162,12 @@ export async function fetchWeather() {
   });
 
   if (!response.ok) {
-    throw new Error(`Open-Meteo responded with status ${response.status}`);
+    const error = new Error(
+      `Open-Meteo responded with status ${response.status}`
+    );
+    error.status = response.status;
+    error.retryAfter = response.headers?.get?.('retry-after') ?? null;
+    throw error;
   }
 
   const json = await response.json();
@@ -246,6 +260,112 @@ export async function fetchWeather() {
   };
 }
 
+function retryAfterMs(value, now) {
+  if (value === null || value === undefined) {
+    return RATE_LIMIT_FALLBACK_MS;
+  }
+
+  const text = String(value).trim();
+  if (!text) return RATE_LIMIT_FALLBACK_MS;
+
+  const seconds = Number(text);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, seconds * 1000);
+  }
+
+  const date = Date.parse(text);
+  if (Number.isFinite(date)) {
+    return Math.max(0, date - now);
+  }
+
+  return RATE_LIMIT_FALLBACK_MS;
+}
+
+function setRetryAfterHeader(res, now) {
+  if (now >= rateLimitedUntil) return;
+
+  res.setHeader(
+    'Retry-After',
+    String(Math.max(1, Math.ceil((rateLimitedUntil - now) / 1000)))
+  );
+}
+
+function sendWeatherFallback(res, now, rateLimited) {
+  if (cache && now - cache.fetchedAt <= WEATHER_STALE_TTL_MS) {
+    if (now < rateLimitedUntil) {
+      setRetryAfterHeader(res, now);
+    }
+
+    return res.json({
+      data: { ...cache.payload, stale: true },
+      cached: true,
+      warning:
+        'Live weather is temporarily unavailable; showing the last successful reading.',
+    });
+  }
+
+  if (rateLimited || now < rateLimitedUntil) {
+    if (now < rateLimitedUntil) {
+      setRetryAfterHeader(res, now);
+    }
+
+    return res.status(503).json({
+      error:
+        'Weather data is temporarily unavailable because the provider is limiting requests. Please try again later.',
+    });
+  }
+
+  return res.status(502).json({
+    error: 'Weather service is temporarily unavailable',
+  });
+}
+
+function loadWeather() {
+  if (inFlight) return inFlight;
+
+  inFlight = (async () => {
+    try {
+      const payload = await fetchWeather();
+      const fetchedAt = Date.now();
+      const record = {
+        ...payload,
+        fetchedAt: new Date(fetchedAt).toISOString(),
+      };
+
+      cache = { fetchedAt, payload: record };
+      rateLimitedUntil = 0;
+
+      return { record, rateLimited: false };
+    } catch (error) {
+      const rateLimited = error?.status === 429;
+      const now = Date.now();
+
+      if (rateLimited) {
+        const delay = retryAfterMs(error.retryAfter, now);
+        rateLimitedUntil = Math.max(rateLimitedUntil, now + delay);
+
+        console.warn(
+          `[weather] Provider rate limit active for ${Math.ceil(
+            Math.max(0, rateLimitedUntil - now) / 1000
+          )}s`
+        );
+      }
+
+      let reason = error?.cause?.code || error?.message || 'unknown error';
+      if (rateLimited) reason = 'HTTP 429';
+      else if (error?.status) reason = `HTTP ${error.status}`;
+
+      console.error('[weather] Live fetch failed:', reason);
+
+      return { error, rateLimited };
+    } finally {
+      inFlight = null;
+    }
+  })();
+
+  return inFlight;
+}
+
 // PUBLIC: Current weather for Kombolcha, sourced from Open-Meteo (no API key).
 router.get(
   '/',
@@ -258,39 +378,27 @@ router.get(
 
     const now = Date.now();
 
-    if (cache && now - cache.fetchedAt < CACHE_SECONDS * 1000) {
+    if (cache && now - cache.fetchedAt < WEATHER_CACHE_TTL_MS) {
       return res.json({
         data: { ...cache.payload, stale: false },
         cached: true,
       });
     }
 
-    try {
-      const payload = await fetchWeather();
-      const record = {
-        ...payload,
-        fetchedAt: new Date(now).toISOString(),
-      };
+    if (now < rateLimitedUntil) {
+      return sendWeatherFallback(res, now, true);
+    }
 
-      cache = { fetchedAt: now, payload: record };
+    const result = await loadWeather();
 
-      return res.json({ data: { ...record, stale: false }, cached: false });
-    } catch (error) {
-      console.error('[weather] Live fetch failed:', error.message);
-
-      if (cache) {
-        return res.json({
-          data: { ...cache.payload, stale: true },
-          cached: true,
-          warning:
-            'Live weather is temporarily unavailable; showing the last successful reading.',
-        });
-      }
-
-      return res.status(502).json({
-        error: 'Weather service is temporarily unavailable',
+    if (result.record) {
+      return res.json({
+        data: { ...result.record, stale: false },
+        cached: false,
       });
     }
+
+    return sendWeatherFallback(res, Date.now(), result.rateLimited);
   })
 );
 

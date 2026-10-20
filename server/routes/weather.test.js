@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 
 const { buildApp } = await import('../test/buildApp.js');
-const { default: weather, resetWeatherCache } = await import('./weather.js');
+const {
+  default: weather,
+  resetWeatherCache,
+  WEATHER_CACHE_TTL_MS,
+  WEATHER_STALE_TTL_MS,
+} = await import('./weather.js');
 
 const app = buildApp(weather);
 
@@ -88,6 +93,35 @@ function mockProvider(payload) {
   });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
+}
+
+function mockRateLimit(retryAfter = '120') {
+  const fetchMock = vi.fn().mockResolvedValue({
+    ok: false,
+    status: 429,
+    headers: {
+      get: (name) =>
+        name.toLowerCase() === 'retry-after' ? retryAfter : null,
+    },
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+function deferredProvider(payload = openMeteoResponse()) {
+  let resolveFetch;
+  const pending = new Promise((resolve) => {
+    resolveFetch = resolve;
+  });
+  const fetchMock = vi.fn().mockReturnValue(pending);
+  vi.stubGlobal('fetch', fetchMock);
+
+  return {
+    fetchMock,
+    resolve() {
+      resolveFetch({ ok: true, json: async () => payload });
+    },
+  };
 }
 
 beforeEach(() => {
@@ -191,7 +225,43 @@ describe('GET /weather', () => {
     const second = await request(app).get('/');
 
     expect(second.body.cached).toBe(true);
+    expect(second.body.data.stale).toBe(false);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('refetches after the 15-minute cache window', async () => {
+    const realNow = 1_700_000_000_000;
+    const now = vi.spyOn(Date, 'now').mockReturnValue(realNow);
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    await request(app).get('/');
+
+    now.mockReturnValue(realNow + WEATHER_CACHE_TTL_MS);
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('deduplicates simultaneous requests into one provider call', async () => {
+    const provider = deferredProvider();
+
+    const pending = Promise.all([
+      request(app).get('/'),
+      request(app).get('/'),
+    ]);
+
+    await vi.waitFor(() =>
+      expect(provider.fetchMock).toHaveBeenCalledTimes(1)
+    );
+    provider.resolve();
+
+    const [first, second] = await pending;
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(provider.fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('returns 502 when the provider fails and no reading is cached', async () => {
@@ -208,16 +278,107 @@ describe('GET /weather', () => {
 
     await request(app).get('/');
 
-    // Expire the cache window, then make the provider fail.
+    // Expire the fresh cache window, then make the provider fail.
     const realNow = Date.now();
-    vi.spyOn(Date, 'now').mockReturnValue(realNow + 11 * 60 * 1000);
+    vi.spyOn(Date, 'now').mockReturnValue(
+      realNow + WEATHER_CACHE_TTL_MS + 60 * 1000
+    );
     fetchMock.mockRejectedValue(new Error('offline'));
 
     const response = await request(app).get('/');
 
     expect(response.status).toBe(200);
+    expect(response.body.cached).toBe(true);
     expect(response.body.data.stale).toBe(true);
     expect(response.body.warning).toMatch(/last successful reading/);
+  });
+
+  it('stops serving stale data after 6 hours', async () => {
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    await request(app).get('/');
+
+    const realNow = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(
+      realNow + WEATHER_STALE_TTL_MS + 1
+    );
+    fetchMock.mockRejectedValue(new Error('offline'));
+
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(502);
+    expect(response.body.data).toBeUndefined();
+  });
+
+  it('returns 503 and honors Retry-After when rate-limited without a cache', async () => {
+    const realNow = 1_700_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(realNow);
+    const fetchMock = mockRateLimit('120');
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(503);
+    expect(first.body.error).toMatch(/limiting requests/);
+    expect(first.headers['retry-after']).toBe('120');
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves stale data and suppresses upstream calls while rate-limited', async () => {
+    const realNow = 1_700_000_000_000;
+    const now = vi.spyOn(Date, 'now').mockReturnValue(realNow);
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    await request(app).get('/');
+
+    now.mockReturnValue(realNow + WEATHER_CACHE_TTL_MS + 60 * 1000);
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 429,
+      headers: {
+        get: (name) =>
+          name.toLowerCase() === 'retry-after' ? '120' : null,
+      },
+    });
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(true);
+    expect(second.body.data.stale).toBe(true);
+    expect(second.headers['retry-after']).toBe('120');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const third = await request(app).get('/');
+
+    expect(third.status).toBe(200);
+    expect(third.body.data.stale).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries after Retry-After and recovers when the provider works again', async () => {
+    const realNow = 1_700_000_000_000;
+    const now = vi.spyOn(Date, 'now').mockReturnValue(realNow);
+    const fetchMock = mockRateLimit('60');
+
+    const first = await request(app).get('/');
+    expect(first.status).toBe(503);
+
+    now.mockReturnValue(realNow + 60 * 1000);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => openMeteoResponse(),
+    });
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(false);
+    expect(second.body.data.stale).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('reports a non-OK provider response as unavailable', async () => {
