@@ -1,6 +1,8 @@
 import { supabase } from './lib/supabase.js';
 
-const BASE = import.meta.env.VITE_API_URL || '/api';
+const BASE = (
+  import.meta.env.VITE_API_URL || 'http://localhost:5000'
+).replace(/\/+$/, '');
 
 function queryString(params = {}) {
   const search = new URLSearchParams();
