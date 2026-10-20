@@ -1,5 +1,5 @@
 /**
- * Seeds demo content for the Kombolcha Smart City portal.
+ * Seeds demo content for the Smart City Information Portal.
  *
  * Usage:
  *   npm run seed            # inserts only when the tables are empty

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { pool } from '../db.js';
+import { requireAdmin } from '../middleware/requireAdmin.js';
 import {
   asyncRoute,
   badRequest,
@@ -9,22 +10,30 @@ import {
   parseLimit,
   requireString,
 } from '../lib/http.js';
+import {
+  addCategoryFilter,
+  normalizeCategory,
+} from '../lib/categories.js';
 
 const router = Router();
 
+// PUBLIC: List mapped service locations
 router.get(
   '/',
   asyncRoute(async (req, res) => {
     const { category, limit } = req.query;
-    const filters = ['latitude is not null', 'longitude is not null'];
+    const filters = [
+      'latitude is not null',
+      'longitude is not null',
+      'latitude between -90 and 90',
+      'longitude between -180 and 180',
+    ];
     const values = [];
 
-    if (category && category !== 'all') {
-      values.push(String(category));
-      filters.push(`category = $${values.length}`);
-    }
+    addCategoryFilter(filters, values, category);
 
     values.push(parseLimit(limit, 500, 500));
+
     const { rows } = await pool.query(
       `select id, name, category, latitude, longitude, created_at
        from public.service_locations
@@ -38,26 +47,49 @@ router.get(
   })
 );
 
+// PUBLIC: Get one location
 router.get(
   '/:id',
   asyncRoute(async (req, res) => {
     const id = parseId(req.params.id);
-    const { rows } = await pool.query('select * from public.service_locations where id = $1', [id]);
+
+    const { rows } = await pool.query(
+      'select * from public.service_locations where id = $1',
+      [id]
+    );
+
     if (!rows[0]) throw notFound('Location not found');
+
     res.json({ data: rows[0] });
   })
 );
 
+// ADMIN ONLY: Create location
 router.post(
   '/',
+  requireAdmin,
   asyncRoute(async (req, res) => {
-    const name = requireString(req.body.name, 'name', { max: 200 });
-    const category = requireString(req.body.category ?? 'government', 'category', { max: 40 });
-    const latitude = optionalNumber(req.body.latitude, 'latitude', { min: -90, max: 90 });
-    const longitude = optionalNumber(req.body.longitude, 'longitude', { min: -180, max: 180 });
+    const name = requireString(req.body.name, 'name', {
+      max: 200,
+    });
+    const category = normalizeCategory(
+      req.body.category ?? 'emergency',
+      { field: 'category' }
+    );
+    const latitude = optionalNumber(
+      req.body.latitude,
+      'latitude',
+      { min: -90, max: 90 }
+    );
+    const longitude = optionalNumber(
+      req.body.longitude,
+      'longitude',
+      { min: -180, max: 180 }
+    );
 
     const { rows } = await pool.query(
-      `insert into public.service_locations (name, category, latitude, longitude)
+      `insert into public.service_locations
+       (name, category, latitude, longitude)
        values ($1, $2, $3, $4)
        returning *`,
       [name, category, latitude, longitude]
@@ -67,33 +99,58 @@ router.post(
   })
 );
 
+// ADMIN ONLY: Update location
 router.put(
   '/:id',
+  requireAdmin,
   asyncRoute(async (req, res) => {
     const id = parseId(req.params.id);
     const fields = [];
     const values = [];
 
     if (req.body.name !== undefined) {
-      values.push(requireString(req.body.name, 'name', { max: 200 }));
+      values.push(
+        requireString(req.body.name, 'name', { max: 200 })
+      );
       fields.push(`name = $${values.length}`);
     }
+
     if (req.body.category !== undefined) {
-      values.push(requireString(req.body.category, 'category', { max: 40 }));
+      values.push(
+        normalizeCategory(req.body.category, {
+          field: 'category',
+          allowLegacy: true,
+        })
+      );
       fields.push(`category = $${values.length}`);
     }
+
     if (req.body.latitude !== undefined) {
-      values.push(optionalNumber(req.body.latitude, 'latitude', { min: -90, max: 90 }));
+      values.push(
+        optionalNumber(req.body.latitude, 'latitude', {
+          min: -90,
+          max: 90,
+        })
+      );
       fields.push(`latitude = $${values.length}`);
     }
+
     if (req.body.longitude !== undefined) {
-      values.push(optionalNumber(req.body.longitude, 'longitude', { min: -180, max: 180 }));
+      values.push(
+        optionalNumber(req.body.longitude, 'longitude', {
+          min: -180,
+          max: 180,
+        })
+      );
       fields.push(`longitude = $${values.length}`);
     }
 
-    if (!fields.length) throw badRequest('No fields to update');
+    if (!fields.length) {
+      throw badRequest('No fields to update');
+    }
 
     values.push(id);
+
     const { rows } = await pool.query(
       `update public.service_locations
        set ${fields.join(', ')}
@@ -103,19 +160,25 @@ router.put(
     );
 
     if (!rows[0]) throw notFound('Location not found');
+
     res.json({ data: rows[0] });
   })
 );
 
+// ADMIN ONLY: Delete location
 router.delete(
   '/:id',
+  requireAdmin,
   asyncRoute(async (req, res) => {
     const id = parseId(req.params.id);
+
     const { rows } = await pool.query(
       'delete from public.service_locations where id = $1 returning id',
       [id]
     );
+
     if (!rows[0]) throw notFound('Location not found');
+
     res.json({ data: { id: rows[0].id } });
   })
 );

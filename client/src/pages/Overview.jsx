@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { api } from '../api.js';
-import { CATEGORY_META, categoryMeta } from '../categories.js';
+import { FILTER_CATEGORIES, categoryMeta } from '../categories.js';
 import { useApi } from '../hooks.js';
 import { timeAgo } from '../utils.js';
 import Icon from '../components/Icon.jsx';
@@ -32,7 +32,7 @@ export default function Overview({ onNavigate }) {
     const byCategory = payload?.byCategory;
     if (!byCategory) return [];
 
-    const rows = Object.keys(CATEGORY_META).map((key) => {
+    const rows = FILTER_CATEGORIES.map((key) => {
       const services = byCategory.services.find((row) => row.category === key)?.count ?? 0;
       const locations = byCategory.locations.find((row) => row.category === key)?.count ?? 0;
       return { key, services, locations, total: services + locations };
@@ -52,14 +52,30 @@ export default function Overview({ onNavigate }) {
           <h1>Kombolcha, connected.</h1>
           <p>Announcements, public services and essential locations across the city, in one place.</p>
           <div className="hero-actions">
-            <button type="button" className="btn primary" onClick={() => onNavigate('announcements')}>
+            <a
+              className="btn primary"
+              href="#announcements"
+              onClick={(event) => {
+                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                event.preventDefault();
+                onNavigate('announcements');
+              }}
+            >
               <Icon name="megaphone" size={18} />
               Read announcements
-            </button>
-            <button type="button" className="btn ghost" onClick={() => onNavigate('map')}>
+            </a>
+            <a
+              className="btn ghost"
+              href="#map"
+              onClick={(event) => {
+                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                event.preventDefault();
+                onNavigate('map');
+              }}
+            >
               <Icon name="map" size={18} />
               Explore the map
-            </button>
+            </a>
           </div>
         </div>
         <div className="hero-art" aria-hidden="true">
@@ -121,10 +137,18 @@ export default function Overview({ onNavigate }) {
               <h2>Latest announcements</h2>
               <p>Recent notices from the city administration.</p>
             </div>
-            <button type="button" className="btn ghost small" onClick={() => onNavigate('announcements')}>
+            <a
+              className="btn ghost small"
+              href="#announcements"
+              onClick={(event) => {
+                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                event.preventDefault();
+                onNavigate('announcements');
+              }}
+            >
               View all
               <Icon name="arrow" size={16} />
-            </button>
+            </a>
           </header>
 
           {recent.loading ? (
@@ -149,7 +173,15 @@ export default function Overview({ onNavigate }) {
                 const meta = categoryMeta(item.category);
                 return (
                   <li key={item.id}>
-                    <button type="button" className="recent-item" onClick={() => onNavigate('announcements')}>
+                    <a
+                      className="recent-item"
+                      href="#announcements"
+                      onClick={(event) => {
+                        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                        event.preventDefault();
+                        onNavigate('announcements');
+                      }}
+                    >
                       <span className="recent-dot" style={{ '--dot': meta.color }} />
                       <span className="recent-body">
                         <strong>{item.title}</strong>
@@ -158,7 +190,7 @@ export default function Overview({ onNavigate }) {
                         </span>
                       </span>
                       <Icon name="arrow" size={17} className="recent-arrow" />
-                    </button>
+                    </a>
                   </li>
                 );
               })}
@@ -205,10 +237,18 @@ export default function Overview({ onNavigate }) {
             </div>
           )}
 
-          <button type="button" className="btn ghost small panel-cta" onClick={() => onNavigate('services')}>
+          <a
+            className="btn ghost small panel-cta"
+            href="#services"
+            onClick={(event) => {
+              if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+              event.preventDefault();
+              onNavigate('services');
+            }}
+          >
             Browse services
             <Icon name="arrow" size={16} />
-          </button>
+          </a>
         </section>
       </div>
     </div>

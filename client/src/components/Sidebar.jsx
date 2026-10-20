@@ -1,9 +1,12 @@
 import Icon from './Icon.jsx';
+import SmartCityLogo from './SmartCityLogo.jsx';
 
 const NAV = [
   { id: 'overview', label: 'Overview', icon: 'grid' },
   { id: 'announcements', label: 'Announcements', icon: 'megaphone' },
   { id: 'services', label: 'Services', icon: 'briefcase' },
+  { id: 'transport', label: 'Transport', icon: 'bus' },
+  { id: 'weather', label: 'Weather', icon: 'cloud' },
   { id: 'map', label: 'City map', icon: 'map' },
 ];
 
@@ -11,25 +14,29 @@ export default function Sidebar({ page, onNavigate, online }) {
   return (
     <aside className="sidebar">
       <div className="brand">
-        <span className="brand-mark">K</span>
-        <span className="brand-text">
-          <strong>Kombolcha</strong>
-          <span>Smart City</span>
-        </span>
+        <SmartCityLogo size={40} showWordmark />
       </div>
 
       <nav className="nav" aria-label="Main navigation">
         <span className="nav-label">Menu</span>
         {NAV.map((item) => (
-          <button
+          <a
             key={item.id}
-            type="button"
+            href={`#${item.id}`}
             className={`nav-item ${page === item.id ? 'active' : ''}`}
-            onClick={() => onNavigate(item.id)}
+            aria-current={page === item.id ? 'page' : undefined}
+            onClick={(event) => {
+              // Let modified clicks open the page in a new tab as usual.
+              if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+                return;
+              }
+              event.preventDefault();
+              onNavigate(item.id);
+            }}
           >
             <Icon name={item.icon} />
             <span>{item.label}</span>
-          </button>
+          </a>
         ))}
       </nav>
 

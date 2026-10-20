@@ -1,6 +1,13 @@
 import Icon from './Icon.jsx';
 
-export default function EmptyState({ icon = 'spark', title, description, actionLabel, onAction }) {
+export default function EmptyState({
+  icon = 'spark',
+  title,
+  description,
+  actionLabel,
+  actionIcon = 'plus',
+  onAction,
+}) {
   return (
     <div className="empty-state">
       <span className="empty-icon">
@@ -10,7 +17,7 @@ export default function EmptyState({ icon = 'spark', title, description, actionL
       {description && <p>{description}</p>}
       {actionLabel && onAction && (
         <button type="button" className="btn primary" onClick={onAction}>
-          <Icon name="plus" size={18} />
+          <Icon name={actionIcon} size={18} />
           {actionLabel}
         </button>
       )}

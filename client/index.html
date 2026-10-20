@@ -5,9 +5,41 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Kombolcha Smart City portal - city announcements, public services and an interactive service map."
+      content="Smart City Information Portal - city announcements, public services and an interactive service map for Kombolcha."
     />
-    <title>Kombolcha Smart City</title>
+    <meta name="application-name" content="Smart City Information Portal" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#0f766e" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0c1614" media="(prefers-color-scheme: dark)" />
+    <title>Smart City Information Portal</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <script>
+      // Apply the saved colour theme before the app renders to avoid a flash of
+      // the wrong theme. Keep the storage key in sync with client/src/theme.js.
+      (function () {
+        try {
+          var key = 'kombolcha-theme';
+          var stored = window.localStorage.getItem(key);
+          var preference =
+            stored === 'light' || stored === 'dark' || stored === 'system'
+              ? stored
+              : 'system';
+          var prefersDark =
+            window.matchMedia &&
+            window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var theme =
+            preference === 'dark' || (preference === 'system' && prefersDark)
+              ? 'dark'
+              : 'light';
+          var root = document.documentElement;
+          root.setAttribute('data-theme', theme);
+          root.setAttribute('data-theme-preference', preference);
+          root.style.colorScheme = theme;
+        } catch (error) {
+          /* localStorage or matchMedia unavailable: fall back to light. */
+        }
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link

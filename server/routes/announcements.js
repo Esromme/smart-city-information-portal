@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { pool } from '../db.js';
+import { requireAdmin } from '../middleware/requireAdmin.js';
 import {
   asyncRoute,
   badRequest,
@@ -8,9 +9,14 @@ import {
   parseLimit,
   requireString,
 } from '../lib/http.js';
+import {
+  addCategoryFilter,
+  normalizeCategory,
+} from '../lib/categories.js';
 
 const router = Router();
 
+// PUBLIC: List announcements
 router.get(
   '/',
   asyncRoute(async (req, res) => {
@@ -18,18 +24,20 @@ router.get(
     const filters = [];
     const values = [];
 
-    if (category && category !== 'all') {
-      values.push(String(category));
-      filters.push(`category = $${values.length}`);
-    }
+    addCategoryFilter(filters, values, category);
 
     if (search) {
       values.push(`%${String(search).trim()}%`);
-      filters.push(`(title ILIKE $${values.length} OR content ILIKE $${values.length})`);
+      filters.push(
+        `(title ILIKE $${values.length} OR content ILIKE $${values.length})`
+      );
     }
 
     values.push(parseLimit(limit));
-    const where = filters.length ? `where ${filters.join(' and ')}` : '';
+    const where = filters.length
+      ? `where ${filters.join(' and ')}`
+      : '';
+
     const { rows } = await pool.query(
       `select id, title, content, category, published_at
        from public.announcements
@@ -43,22 +51,38 @@ router.get(
   })
 );
 
+// PUBLIC: Get one announcement
 router.get(
   '/:id',
   asyncRoute(async (req, res) => {
     const id = parseId(req.params.id);
-    const { rows } = await pool.query('select * from public.announcements where id = $1', [id]);
+
+    const { rows } = await pool.query(
+      'select * from public.announcements where id = $1',
+      [id]
+    );
+
     if (!rows[0]) throw notFound('Announcement not found');
+
     res.json({ data: rows[0] });
   })
 );
 
+// ADMIN ONLY: Create announcement
 router.post(
   '/',
+  requireAdmin,
   asyncRoute(async (req, res) => {
-    const title = requireString(req.body.title, 'title', { max: 200 });
-    const content = requireString(req.body.content, 'content', { max: 10000 });
-    const category = requireString(req.body.category ?? 'community', 'category', { max: 40 });
+    const title = requireString(req.body.title, 'title', {
+      max: 200,
+    });
+    const content = requireString(req.body.content, 'content', {
+      max: 10000,
+    });
+    const category = normalizeCategory(
+      req.body.category ?? 'water',
+      { field: 'category' }
+    );
 
     const { rows } = await pool.query(
       `insert into public.announcements (title, content, category)
@@ -71,29 +95,47 @@ router.post(
   })
 );
 
+// ADMIN ONLY: Update announcement
 router.put(
   '/:id',
+  requireAdmin,
   asyncRoute(async (req, res) => {
     const id = parseId(req.params.id);
     const fields = [];
     const values = [];
 
     if (req.body.title !== undefined) {
-      values.push(requireString(req.body.title, 'title', { max: 200 }));
+      values.push(
+        requireString(req.body.title, 'title', { max: 200 })
+      );
       fields.push(`title = $${values.length}`);
     }
+
     if (req.body.content !== undefined) {
-      values.push(requireString(req.body.content, 'content', { max: 10000 }));
+      values.push(
+        requireString(req.body.content, 'content', {
+          max: 10000,
+        })
+      );
       fields.push(`content = $${values.length}`);
     }
+
     if (req.body.category !== undefined) {
-      values.push(requireString(req.body.category, 'category', { max: 40 }));
+      values.push(
+        normalizeCategory(req.body.category, {
+          field: 'category',
+          allowLegacy: true,
+        })
+      );
       fields.push(`category = $${values.length}`);
     }
 
-    if (!fields.length) throw badRequest('No fields to update');
+    if (!fields.length) {
+      throw badRequest('No fields to update');
+    }
 
     values.push(id);
+
     const { rows } = await pool.query(
       `update public.announcements
        set ${fields.join(', ')}
@@ -103,19 +145,25 @@ router.put(
     );
 
     if (!rows[0]) throw notFound('Announcement not found');
+
     res.json({ data: rows[0] });
   })
 );
 
+// ADMIN ONLY: Delete announcement
 router.delete(
   '/:id',
+  requireAdmin,
   asyncRoute(async (req, res) => {
     const id = parseId(req.params.id);
+
     const { rows } = await pool.query(
       'delete from public.announcements where id = $1 returning id',
       [id]
     );
+
     if (!rows[0]) throw notFound('Announcement not found');
+
     res.json({ data: { id: rows[0].id } });
   })
 );
