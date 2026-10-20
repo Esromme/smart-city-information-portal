@@ -1,5 +1,5 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
-import { useApi } from '../hooks.js';
 import { timeAgo } from '../utils.js';
 import Icon from '../components/Icon.jsx';
 
@@ -141,11 +141,105 @@ function WeatherSkeleton() {
   );
 }
 
+// React StrictMode runs mount effects twice in development. Share an in-flight
+// request so the weather page never asks the API for the same reading twice.
+let pendingWeatherRequest = null;
+
+function requestWeather() {
+  if (!pendingWeatherRequest) {
+    pendingWeatherRequest = (async () => {
+      try {
+        return await api.weather();
+      } finally {
+        pendingWeatherRequest = null;
+      }
+    })();
+  }
+
+  return pendingWeatherRequest;
+}
+
+const RATE_LIMIT_MESSAGE =
+  'Weather is temporarily unavailable because the provider is limiting requests. Please try again in a minute.';
+const WEATHER_UNAVAILABLE_MESSAGE =
+  'Weather data is temporarily unavailable. Please try again shortly.';
+
+function weatherErrorMessage(error) {
+  const message =
+    typeof error?.message === 'string' ? error.message.trim() : '';
+
+  if (error?.status === 429 || error?.status === 503) {
+    return /^Request failed \(\d+\)$/i.test(message)
+      ? RATE_LIMIT_MESSAGE
+      : message || RATE_LIMIT_MESSAGE;
+  }
+
+  if (error?.status === 502) {
+    return /^Request failed \(\d+\)$/i.test(message)
+      ? WEATHER_UNAVAILABLE_MESSAGE
+      : message || WEATHER_UNAVAILABLE_MESSAGE;
+  }
+
+  return message || WEATHER_UNAVAILABLE_MESSAGE;
+}
+
+function useWeather() {
+  const [state, setState] = useState({
+    data: null,
+    loading: true,
+    error: null,
+  });
+  const mounted = useRef(true);
+
+  const reload = useCallback(async () => {
+    setState((previous) => ({
+      ...previous,
+      loading: true,
+      error: null,
+    }));
+
+    try {
+      const result = await requestWeather();
+
+      if (!mounted.current) return;
+
+      setState({ data: result, loading: false, error: null });
+    } catch (error) {
+      if (!mounted.current) return;
+
+      setState((previous) => ({
+        ...previous,
+        loading: false,
+        error: weatherErrorMessage(error),
+      }));
+    }
+  }, []);
+
+  useEffect(() => {
+    mounted.current = true;
+    reload();
+
+    return () => {
+      mounted.current = false;
+    };
+  }, [reload]);
+
+  return { ...state, reload };
+}
+
 export default function Weather() {
-  const { data, loading, error, reload } = useApi(() => api.weather(), []);
+  const { data, loading, error, reload } = useWeather();
 
   const weather = data?.data ?? null;
-  const warning = data?.warning || weather?.warning || null;
+  const cached = data?.cached === true;
+  const stale = weather?.stale === true;
+  const warning =
+    data?.warning ||
+    weather?.warning ||
+    (stale
+      ? 'Live weather is temporarily unavailable; showing the last successful reading.'
+      : null);
+  const showCachedBadge = stale || (cached && Boolean(warning));
 
   const hourly = weather?.hourly ?? [];
   const daily = weather?.daily ?? [];
@@ -207,6 +301,9 @@ export default function Weather() {
           {error && (
             <div className="alert" role="alert">
               {error}
+              {weather
+                ? ' Showing the last successful reading below.'
+                : ''}
             </div>
           )}
 
@@ -253,7 +350,7 @@ export default function Weather() {
                       High {highLow.max}° · Low {highLow.min}°
                     </span>
                   )}
-                  {weather.stale && (
+                  {showCachedBadge && (
                     <span className="weather-chip is-stale">
                       <Icon name="warning" size={12} />
                       Cached reading

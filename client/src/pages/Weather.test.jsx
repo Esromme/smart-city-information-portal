@@ -1,3 +1,4 @@
+import { StrictMode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
@@ -216,6 +217,62 @@ describe('Weather', () => {
     fireEvent.click(screen.getByRole('button', { name: /refresh/i }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Network error.');
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /last successful reading below/i
+    );
     await waitFor(() => expect(screen.getByText('22.9')).toBeInTheDocument());
+  });
+
+  it('requests the weather once when React StrictMode re-runs effects', async () => {
+    mockWeather.mockResolvedValue(envelope());
+
+    render(
+      <StrictMode>
+        <Weather />
+      </StrictMode>
+    );
+
+    expect(await screen.findByText('22.9')).toBeInTheDocument();
+    expect(mockWeather).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a friendly rate-limit message and waits for an explicit retry', async () => {
+    mockWeather.mockRejectedValueOnce(
+      Object.assign(new Error('Request failed (503)'), { status: 503 })
+    );
+
+    render(<Weather />);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/provider is limiting requests/i);
+    expect(mockWeather).toHaveBeenCalledTimes(1);
+
+    mockWeather.mockResolvedValue(envelope());
+    fireEvent.click(screen.getByRole('button', { name: /try again/i }));
+
+    expect(await screen.findByText('22.9')).toBeInTheDocument();
+    expect(mockWeather).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the reading when a refresh is rate-limited', async () => {
+    mockWeather.mockResolvedValueOnce(envelope());
+    render(<Weather />);
+    expect(await screen.findByText('22.9')).toBeInTheDocument();
+
+    mockWeather.mockRejectedValueOnce(
+      Object.assign(
+        new Error(
+          'Weather data is temporarily unavailable because the provider is limiting requests.'
+        ),
+        { status: 503 }
+      )
+    );
+    fireEvent.click(screen.getByRole('button', { name: /refresh/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /provider is limiting requests/i
+    );
+    expect(screen.getByText('22.9')).toBeInTheDocument();
+    expect(mockWeather).toHaveBeenCalledTimes(2);
   });
 });
