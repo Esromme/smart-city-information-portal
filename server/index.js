@@ -23,7 +23,11 @@ if (process.env.TRUST_PROXY === '1') {
   app.set('trust proxy', 1);
 }
 
+// Always allow the deployed frontend and local development. Additional
+// origins from CORS_ORIGINS are additive, not a replacement.
 const DEFAULT_ORIGINS = [
+  'https://kombolcha-smart-city.vercel.app',
+  'https://kombolcha-smart-city-4dmdcfe8y-esromme.vercel.app',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'http://localhost:5000',
@@ -35,9 +39,7 @@ const configuredOrigins = (process.env.CORS_ORIGINS || '')
   .map((origin) => origin.trim())
   .filter(Boolean);
 
-const allowedOrigins = new Set(
-  configuredOrigins.length ? configuredOrigins : DEFAULT_ORIGINS
-);
+const allowedOrigins = new Set([...DEFAULT_ORIGINS, ...configuredOrigins]);
 
 app.use(
   cors({

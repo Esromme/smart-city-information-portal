@@ -1,8 +1,12 @@
 import { supabase } from './lib/supabase.js';
 
-const BASE = (
-  import.meta.env.VITE_API_URL || 'http://localhost:5000'
-).replace(/\/+$/, '');
+// All backend routes are mounted under /api. Accept either an origin
+// (https://api.example.com) or an origin that already includes /api.
+const API_BASE = (import.meta.env.VITE_API_URL || '/api')
+  .trim()
+  .replace(/\/+$/, '');
+
+const BASE = API_BASE.endsWith('/api') ? API_BASE : `${API_BASE}/api`;
 
 function queryString(params = {}) {
   const search = new URLSearchParams();
