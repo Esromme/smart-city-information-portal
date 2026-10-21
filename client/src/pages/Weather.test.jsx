@@ -165,6 +165,28 @@ describe('Weather', () => {
     ).toHaveAttribute('href', 'https://open-meteo.com/');
   });
 
+  it('shows WeatherAPI attribution and the required disclaimer for fallback data', async () => {
+    mockWeather.mockResolvedValue(
+      envelope({
+        source: {
+          name: 'WeatherAPI.com',
+          url: 'https://www.weatherapi.com/',
+          license: 'WeatherAPI.com Terms and Conditions',
+          attribution: 'Powered by WeatherAPI.com',
+        },
+      })
+    );
+
+    render(<Weather />);
+
+    expect(
+      await screen.findByRole('link', { name: /powered by weatherapi.com/i })
+    ).toHaveAttribute('href', 'https://www.weatherapi.com/');
+    expect(screen.getByRole('note')).toHaveTextContent(
+      /weather information displayed here is provided for general informational purposes only/i
+    );
+  });
+
   it('offers a retry when the request fails, then recovers', async () => {
     mockWeather.mockRejectedValueOnce(new Error('Weather service is offline.'));
 

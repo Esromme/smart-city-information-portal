@@ -163,6 +163,8 @@ const RATE_LIMIT_MESSAGE =
   'Weather is temporarily unavailable because the provider is limiting requests. Please try again in a minute.';
 const WEATHER_UNAVAILABLE_MESSAGE =
   'Weather data is temporarily unavailable. Please try again shortly.';
+const WEATHERAPI_DISCLAIMER =
+  'Weather information displayed here is provided for general informational purposes only. Forecasts and conditions are probabilistic and may not be accurate for your specific location or time. This data should not be used as the sole basis for decisions involving personal safety, aviation, marine navigation, emergency planning, or other safety-critical activities. Always consult official meteorological services and relevant authorities for decisions where accuracy is critical.';
 
 function weatherErrorMessage(error) {
   const message =
@@ -233,6 +235,7 @@ export default function Weather() {
   const weather = data?.data ?? null;
   const cached = data?.cached === true;
   const stale = weather?.stale === true;
+  const weatherApiSource = weather?.source?.name === 'WeatherAPI.com';
   const warning =
     data?.warning ||
     weather?.warning ||
@@ -274,7 +277,10 @@ export default function Weather() {
         <div>
           <span className="eyebrow">City conditions</span>
           <h1>Weather</h1>
-          <p>Current conditions and forecast for Kombolcha, sourced from Open-Meteo.</p>
+          <p>
+            Current conditions and forecast for Kombolcha, sourced from
+            Open-Meteo with WeatherAPI.com as a fallback.
+          </p>
         </div>
         <button type="button" className="btn ghost" onClick={reload} disabled={loading}>
           <Icon name="refresh" size={17} />
@@ -377,6 +383,13 @@ export default function Weather() {
               </a>
             </div>
           </section>
+
+          {weatherApiSource && (
+            <p className="wx-note" role="note">
+              <Icon name="shield" size={15} />
+              <span>{WEATHERAPI_DISCLAIMER}</span>
+            </p>
+          )}
 
           <section className="wx-section" aria-labelledby="wx-insights-heading">
             <div className="wx-section-head">

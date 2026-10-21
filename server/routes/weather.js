@@ -10,17 +10,22 @@ const TIMEOUT_MS = Number(process.env.WEATHER_TIMEOUT_MS) || 8000;
 const ENABLED = process.env.WEATHER_ENABLED !== 'false';
 
 // Fresh responses are served for 15 minutes. If the provider is unavailable,
-// the last successful response can be served for up to 6 hours.
+// the last successful response can be served for up to 6 hours. WeatherAPI.com
+// current conditions may only be cached for 60 minutes under its terms, so
+// fallback data from that provider gets a shorter stale window.
 export const WEATHER_CACHE_TTL_MS = 15 * 60 * 1000;
 export const WEATHER_STALE_TTL_MS = 6 * 60 * 60 * 1000;
+export const WEATHERAPI_STALE_TTL_MS = 60 * 60 * 1000;
 export const WEATHER_PERSISTENCE_TIMEOUT_MS = 2000;
 // After a persisted read fails or returns an unusable row, skip further reads
 // for this long. Live provider calls and stale fallback are never suppressed.
 export const WEATHER_PERSISTENCE_RETRY_MS = 60 * 1000;
 const RATE_LIMIT_FALLBACK_MS = 60 * 1000;
+const WEATHERAPI_FORECAST_DAYS = 3;
 
 // The persisted row is keyed by location and timezone so a coordinate change
-// cannot reuse a reading for another place.
+// cannot reuse a reading for another place. The key is kept stable for existing
+// rows even when the current reading came from the secondary provider.
 const WEATHER_CACHE_KEY = `open-meteo:v1:${LATITUDE}:${LONGITUDE}:Africa/Addis_Ababa`;
 
 export const WEATHER_SOURCE = Object.freeze({
@@ -28,6 +33,79 @@ export const WEATHER_SOURCE = Object.freeze({
   url: 'https://open-meteo.com/',
   license: 'CC BY 4.0',
   attribution: 'Weather data by Open-Meteo.com',
+});
+
+export const WEATHERAPI_SOURCE = Object.freeze({
+  name: 'WeatherAPI.com',
+  url: 'https://www.weatherapi.com/',
+  license: 'WeatherAPI.com Terms and Conditions',
+  attribution: 'Powered by WeatherAPI.com',
+});
+
+// WeatherAPI.com condition codes mapped onto the WMO codes used by the public
+// response shape. Descriptions still use the provider's own condition text when
+// available, which keeps rare conditions such as dust storms accurate.
+export const WEATHERAPI_TO_WMO = Object.freeze({
+  1000: 0, // Sunny / Clear
+  1003: 2, // Partly cloudy
+  1006: 3, // Cloudy
+  1009: 3, // Overcast
+  1012: 45, // Haze
+  1015: 45, // Dust haze
+  1018: 45, // Blowing dust
+  1021: 45, // Dust storm
+  1024: 45, // Sandstorm
+  1027: 45, // Severe sandstorm
+  1030: 45, // Mist
+  1033: 45, // Smoke
+  1036: 45, // Smoky haze
+  1039: 45, // Smog
+  1042: 45, // Severe smog
+  1045: 45, // Saharan dust
+  1048: 45, // Dust
+  1063: 80, // Patchy rain possible
+  1066: 85, // Patchy snow possible
+  1069: 66, // Patchy sleet possible
+  1072: 56, // Patchy freezing drizzle possible
+  1087: 95, // Thundery outbreaks possible
+  1114: 85, // Blowing snow
+  1117: 75, // Blizzard
+  1135: 45, // Fog
+  1147: 48, // Freezing fog
+  1150: 51, // Patchy light drizzle
+  1153: 51, // Light drizzle
+  1168: 56, // Freezing drizzle
+  1171: 57, // Heavy freezing drizzle
+  1180: 80, // Patchy light rain
+  1183: 61, // Light rain
+  1186: 63, // Moderate rain at times
+  1189: 63, // Moderate rain
+  1192: 65, // Heavy rain at times
+  1195: 65, // Heavy rain
+  1198: 66, // Light freezing rain
+  1201: 67, // Moderate or heavy freezing rain
+  1204: 66, // Light sleet
+  1207: 67, // Moderate or heavy sleet
+  1210: 85, // Patchy light snow
+  1213: 71, // Light snow
+  1216: 73, // Patchy moderate snow
+  1219: 73, // Moderate snow
+  1222: 75, // Patchy heavy snow
+  1225: 75, // Heavy snow
+  1237: 77, // Ice pellets
+  1240: 80, // Light rain shower
+  1243: 81, // Moderate or heavy rain shower
+  1246: 82, // Torrential rain shower
+  1249: 85, // Light sleet showers
+  1252: 86, // Moderate or heavy sleet showers
+  1255: 85, // Light snow showers
+  1258: 86, // Moderate or heavy snow showers
+  1261: 85, // Light showers of ice pellets
+  1264: 86, // Moderate or heavy showers of ice pellets
+  1273: 95, // Patchy light rain with thunder
+  1276: 95, // Moderate or heavy rain with thunder
+  1279: 95, // Patchy light snow with thunder
+  1282: 95, // Moderate or heavy snow with thunder
 });
 
 // WMO weather interpretation codes used by Open-Meteo.
@@ -66,14 +144,45 @@ let cache = null;
 let inFlight = null;
 let persistedLookup = null;
 let persistedRetryAt = 0;
-let rateLimitedUntil = 0;
+let primaryRateLimitedUntil = 0;
+let secondaryRateLimitedUntil = 0;
 
 export function resetWeatherCache() {
   cache = null;
   inFlight = null;
   persistedLookup = null;
   persistedRetryAt = 0;
-  rateLimitedUntil = 0;
+  primaryRateLimitedUntil = 0;
+  secondaryRateLimitedUntil = 0;
+}
+
+function weatherApiKey() {
+  const value = process.env.WEATHERAPI_API_KEY;
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function staleTtlMsForPayload(payload) {
+  return payload?.source?.name === WEATHERAPI_SOURCE.name
+    ? WEATHERAPI_STALE_TTL_MS
+    : WEATHER_STALE_TTL_MS;
+}
+
+function staleTtlMsForRecord(record) {
+  return staleTtlMsForPayload(record?.payload);
+}
+
+function safeFailureReason(error) {
+  if (error?.status) return `HTTP ${error.status}`;
+  if (error?.code) return String(error.code);
+  if (error?.name === 'TimeoutError') return 'timeout';
+  return 'network error';
+}
+
+function isPermanentProviderFailure(error) {
+  const status = Number(error?.status);
+  if (!Number.isFinite(status)) return false;
+  if (status === 408 || status === 425 || status === 429) return false;
+  return status >= 400 && status < 500;
 }
 
 function toOffsetIso(localTime, offsetSeconds) {
@@ -277,6 +386,334 @@ export async function fetchWeather() {
   };
 }
 
+function weatherApiCondition(condition) {
+  const providerCode = numberOrNull(condition?.code);
+  const text =
+    typeof condition?.text === 'string' && condition.text.trim()
+      ? condition.text.trim()
+      : null;
+
+  return {
+    code:
+      providerCode === null
+        ? null
+        : WEATHERAPI_TO_WMO[providerCode] ?? null,
+    description: text,
+  };
+}
+
+// WeatherAPI.com returns wall-clock times without an offset. Keep them as the
+// same local strings the client already expects, and use the provider's epoch
+// plus IANA timezone only to calculate the offset for observedAt.
+function weatherApiLocalTime(value) {
+  if (typeof value !== 'string') return null;
+
+  const match = value
+    .trim()
+    .match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})/);
+
+  return match ? `${match[1]}T${match[2]}:${match[3]}` : null;
+}
+
+function timezoneOffsetSeconds(epochMs, timeZone) {
+  if (!Number.isFinite(epochMs) || typeof timeZone !== 'string' || !timeZone) {
+    return null;
+  }
+
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(new Date(epochMs));
+
+    const values = Object.fromEntries(
+      parts
+        .filter((part) => part.type !== 'literal')
+        .map((part) => [part.type, Number(part.value)])
+    );
+
+    if (
+      ![
+        values.year,
+        values.month,
+        values.day,
+        values.hour,
+        values.minute,
+        values.second,
+      ].every(Number.isFinite)
+    ) {
+      return null;
+    }
+
+    const asUtc = Date.UTC(
+      values.year,
+      values.month - 1,
+      values.day,
+      values.hour,
+      values.minute,
+      values.second
+    );
+
+    return Math.round(
+      (asUtc - Math.floor(epochMs / 1000) * 1000) / 1000
+    );
+  } catch {
+    return null;
+  }
+}
+
+function formatWeatherApiTimestamp(localTime, epochSeconds, timeZone) {
+  const local = weatherApiLocalTime(localTime);
+  if (!local) return null;
+
+  const epoch = numberOrNull(epochSeconds);
+  if (epoch === null) return local;
+
+  const offset = timezoneOffsetSeconds(epoch * 1000, timeZone);
+  return offset === null ? local : toOffsetIso(local, offset);
+}
+
+function isoFromEpochSeconds(epochSeconds) {
+  const epoch = numberOrNull(epochSeconds);
+  if (epoch === null) return null;
+
+  const date = new Date(epoch * 1000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function weatherApiClock(date, value) {
+  if (typeof date !== 'string' || typeof value !== 'string') {
+    return null;
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return null;
+  }
+
+  const match = value
+    .trim()
+    .match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+
+  if (!match) return null;
+
+  const minutes = Number(match[2]);
+
+  if (!Number.isInteger(minutes) || minutes > 59) {
+    return null;
+  }
+
+  let hours = Number(match[1]);
+
+  if (hours < 1 || hours > 12) {
+    return null;
+  }
+
+  if (match[3].toUpperCase() === 'PM' && hours !== 12) {
+    hours += 12;
+  } else if (match[3].toUpperCase() === 'AM' && hours === 12) {
+    hours = 0;
+  }
+
+  return `${date}T${String(hours).padStart(2, '0')}:${String(
+    minutes
+  ).padStart(2, '0')}`;
+}
+
+function weatherApiPrecipitationChance(dayOrHour) {
+  const rain = numberOrNull(
+    dayOrHour?.daily_chance_of_rain ?? dayOrHour?.chance_of_rain
+  );
+  const snow = numberOrNull(
+    dayOrHour?.daily_chance_of_snow ?? dayOrHour?.chance_of_snow
+  );
+
+  if (rain === null) return snow;
+  if (snow === null) return rain;
+  return Math.max(rain, snow);
+}
+
+function normalizeWeatherApiResponse(json) {
+  const location = json?.location ?? {};
+  const current = json?.current ?? {};
+  const forecastDays = Array.isArray(json?.forecast?.forecastday)
+    ? json.forecast.forecastday.filter(isPlainObject)
+    : [];
+
+  const timezone =
+    typeof location.tz_id === 'string' && location.tz_id.trim()
+      ? location.tz_id.trim()
+      : 'Africa/Addis_Ababa';
+
+  const currentCondition = weatherApiCondition(current.condition);
+  const hourlyEntries = forecastDays.flatMap((day) =>
+    Array.isArray(day.hour) ? day.hour.filter(isPlainObject) : []
+  );
+  const hourlyTimes = hourlyEntries.map((hour) =>
+    weatherApiLocalTime(hour.time)
+  );
+  const currentLocal =
+    weatherApiLocalTime(current.last_updated) ??
+    weatherApiLocalTime(location.localtime);
+  const currentIndex = Math.max(
+    hourlyIndexFor(hourlyTimes, currentLocal),
+    0
+  );
+  const currentHour = hourlyEntries[currentIndex] ?? {};
+
+  const hourly = hourlyEntries
+    .slice(currentIndex, currentIndex + HOURLY_WINDOW)
+    .map((hour, offset) => {
+      const index = currentIndex + offset;
+      const condition = weatherApiCondition(hour.condition);
+
+      return {
+        time: hourlyTimes[index] ?? null,
+        temperatureC: numberOrNull(hour.temp_c),
+        weatherCode: condition.code,
+        description:
+          condition.description ??
+          WMO_DESCRIPTIONS[condition.code] ??
+          'Unknown conditions',
+        precipitationProbability: weatherApiPrecipitationChance(hour),
+        windKph: numberOrNull(hour.wind_kph),
+        isDay: booleanOrNull(hour.is_day),
+      };
+    });
+
+  const daily = forecastDays
+    .map((day) => {
+      if (typeof day.date !== 'string' || !day.date) return null;
+
+      const condition = weatherApiCondition(day.day?.condition);
+
+      return {
+        date: day.date,
+        maxC: numberOrNull(day.day?.maxtemp_c),
+        minC: numberOrNull(day.day?.mintemp_c),
+        weatherCode: condition.code,
+        description:
+          condition.description ??
+          WMO_DESCRIPTIONS[condition.code] ??
+          'Unknown conditions',
+        precipitationProbabilityMax: weatherApiPrecipitationChance(day.day),
+        precipitationMm: numberOrNull(day.day?.totalprecip_mm),
+        uvIndexMax: numberOrNull(day.day?.uv),
+        windKphMax: numberOrNull(day.day?.maxwind_kph),
+        sunrise: weatherApiClock(day.date, day.astro?.sunrise),
+        sunset: weatherApiClock(day.date, day.astro?.sunset),
+      };
+    })
+    .filter(Boolean);
+
+  const today = forecastDays[0]?.day ?? {};
+  const firstDay = forecastDays[0];
+  const observedEpoch =
+    numberOrNull(current.last_updated_epoch) ??
+    numberOrNull(location.localtime_epoch);
+  const observedAt =
+    formatWeatherApiTimestamp(
+      current.last_updated ?? location.localtime,
+      observedEpoch,
+      timezone
+    ) ?? isoFromEpochSeconds(observedEpoch);
+
+  return {
+    location: 'Kombolcha, Ethiopia',
+    latitude: numberOrNull(location.lat) ?? LATITUDE,
+    longitude: numberOrNull(location.lon) ?? LONGITUDE,
+    timezone,
+    observedAt,
+    temperatureC: numberOrNull(current.temp_c),
+    apparentC: numberOrNull(current.feelslike_c),
+    humidity: numberOrNull(current.humidity),
+    precipitationMm: numberOrNull(current.precip_mm),
+    windKph: numberOrNull(current.wind_kph),
+    windDirectionDeg: numberOrNull(current.wind_degree),
+    weatherCode: currentCondition.code,
+    description:
+      currentCondition.description ??
+      WMO_DESCRIPTIONS[currentCondition.code] ??
+      'Unknown conditions',
+    today: {
+      maxC: numberOrNull(today.maxtemp_c),
+      minC: numberOrNull(today.mintemp_c),
+      precipitationProbabilityMax: weatherApiPrecipitationChance(today),
+    },
+    isDay: booleanOrNull(current.is_day),
+    dewPointC: numberOrNull(currentHour.dewpoint_c),
+    uvIndex:
+      numberOrNull(current.uv) ?? numberOrNull(currentHour.uv),
+    visibilityKm:
+      numberOrNull(current.vis_km) ?? numberOrNull(currentHour.vis_km),
+    sunrise: firstDay
+      ? weatherApiClock(firstDay.date, firstDay.astro?.sunrise)
+      : null,
+    sunset: firstDay
+      ? weatherApiClock(firstDay.date, firstDay.astro?.sunset)
+      : null,
+    hourly,
+    daily,
+    source: WEATHERAPI_SOURCE,
+  };
+}
+
+export async function fetchWeatherApiWeather(apiKey) {
+  const url = new URL('https://api.weatherapi.com/v1/forecast.json');
+  url.searchParams.set('key', apiKey);
+  url.searchParams.set('q', `${LATITUDE},${LONGITUDE}`);
+  url.searchParams.set('days', String(WEATHERAPI_FORECAST_DAYS));
+  url.searchParams.set('aqi', 'no');
+  url.searchParams.set('alerts', 'no');
+
+  let response;
+  try {
+    response = await fetch(url, {
+      headers: { 'User-Agent': 'smart-city-information-portal' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+  } catch (error) {
+    // Never carry through a raw error: some runtimes include the request URL,
+    // which contains the API key, in the message or cause.
+    const wrapped = new Error('WeatherAPI.com request failed');
+    wrapped.code =
+      error?.name === 'TimeoutError'
+        ? 'TIMEOUT'
+        : error?.cause?.code ||
+          (typeof error?.code === 'string' ? error.code : 'NETWORK_ERROR');
+    throw wrapped;
+  }
+
+  if (!response.ok) {
+    const error = new Error('WeatherAPI.com request failed');
+    error.status = response.status;
+    error.retryAfter = response.headers?.get?.('retry-after') ?? null;
+    throw error;
+  }
+
+  let json;
+  try {
+    json = await response.json();
+  } catch {
+    const error = new Error('WeatherAPI.com returned malformed JSON');
+    error.code = 'MALFORMED_WEATHER';
+    throw error;
+  }
+
+  try {
+    return normalizeWeatherApiResponse(json);
+  } catch {
+    const error = new Error('WeatherAPI.com returned malformed weather data');
+    error.code = 'MALFORMED_WEATHER';
+    throw error;
+  }
+}
+
 // Bound how long the route waits for persistence. This race does not cancel
 // the underlying query. pg's query_timeout starts only after a pool client is
 // acquired, so a query still queued for a client is not covered here; the
@@ -401,16 +838,6 @@ async function readPersistedWeather() {
   const row = rows?.[0];
   if (!row) return { record: null, rejected: false };
 
-  const fetchedAt = new Date(row.fetched_at).getTime();
-  const checkedAt = Date.now();
-  if (
-    !Number.isFinite(fetchedAt) ||
-    fetchedAt > checkedAt ||
-    checkedAt - fetchedAt > WEATHER_STALE_TTL_MS
-  ) {
-    return { record: null, rejected: true };
-  }
-
   let payload = row.payload;
   if (typeof payload === 'string') {
     try {
@@ -421,6 +848,16 @@ async function readPersistedWeather() {
   }
 
   if (!isUsableWeatherPayload(payload)) {
+    return { record: null, rejected: true };
+  }
+
+  const fetchedAt = new Date(row.fetched_at).getTime();
+  const checkedAt = Date.now();
+  if (
+    !Number.isFinite(fetchedAt) ||
+    fetchedAt > checkedAt ||
+    checkedAt - fetchedAt > staleTtlMsForPayload(payload)
+  ) {
     return { record: null, rejected: true };
   }
 
@@ -470,7 +907,7 @@ async function hydrateWeatherCache(now) {
 
       if (
         record &&
-        now - record.fetchedAt <= WEATHER_STALE_TTL_MS &&
+        now - record.fetchedAt <= staleTtlMsForRecord(record) &&
         (!cache || record.fetchedAt > cache.fetchedAt)
       ) {
         cache = record;
@@ -513,19 +950,23 @@ function retryAfterMs(value, now) {
   return RATE_LIMIT_FALLBACK_MS;
 }
 
-function setRetryAfterHeader(res, now) {
-  if (now >= rateLimitedUntil) return;
+function setRetryAfterHeader(res, now, until) {
+  if (!Number.isFinite(until) || now >= until) return;
 
   res.setHeader(
     'Retry-After',
-    String(Math.max(1, Math.ceil((rateLimitedUntil - now) / 1000)))
+    String(Math.max(1, Math.ceil((until - now) / 1000)))
   );
 }
 
-function sendWeatherFallback(res, now, rateLimited) {
-  if (cache && now - cache.fetchedAt <= WEATHER_STALE_TTL_MS) {
-    if (now < rateLimitedUntil) {
-      setRetryAfterHeader(res, now);
+function sendWeatherFallback(
+  res,
+  now,
+  { rateLimited = false, retryAt = 0 } = {}
+) {
+  if (cache && now - cache.fetchedAt <= staleTtlMsForRecord(cache)) {
+    if (rateLimited) {
+      setRetryAfterHeader(res, now, retryAt);
     }
 
     return res.json({
@@ -536,10 +977,8 @@ function sendWeatherFallback(res, now, rateLimited) {
     });
   }
 
-  if (rateLimited || now < rateLimitedUntil) {
-    if (now < rateLimitedUntil) {
-      setRetryAfterHeader(res, now);
-    }
+  if (rateLimited) {
+    setRetryAfterHeader(res, now, retryAt);
 
     return res.status(503).json({
       error:
@@ -552,60 +991,159 @@ function sendWeatherFallback(res, now, rateLimited) {
   });
 }
 
+async function storeWeather(payload) {
+  const fetchedAt = Date.now();
+  const record = {
+    ...payload,
+    fetchedAt: new Date(fetchedAt).toISOString(),
+  };
+
+  cache = { fetchedAt, payload: record };
+
+  try {
+    await persistWeather(record);
+  } catch (error) {
+    console.error(
+      '[weather] Persistent cache write failed:',
+      error?.message || 'unknown error'
+    );
+  }
+
+  return record;
+}
+
+function activateRateLimit(error, currentUntil, provider) {
+  const now = Date.now();
+  const delay = retryAfterMs(error?.retryAfter, now);
+  const until = Math.max(currentUntil, now + delay);
+
+  console.warn(
+    `[weather] ${provider} rate limit active for ${Math.ceil(
+      Math.max(0, until - now) / 1000
+    )}s`
+  );
+
+  return until;
+}
+
+function earliestFutureRateLimit(...values) {
+  const now = Date.now();
+  const future = values.filter(
+    (value) => Number.isFinite(value) && value > now
+  );
+
+  return future.length > 0 ? Math.min(...future) : 0;
+}
+
 function loadWeather() {
   if (inFlight) return inFlight;
 
   inFlight = (async () => {
     try {
-      const payload = await fetchWeather();
+      let primaryError = null;
+      let primaryRateLimited = false;
 
-      if (!isUsableWeatherPayload(payload)) {
-        const error = new Error('Open-Meteo returned no usable weather data');
-        error.code = 'EMPTY_WEATHER';
-        throw error;
+      if (Date.now() < primaryRateLimitedUntil) {
+        primaryRateLimited = true;
+        primaryError = new Error('Open-Meteo rate limit cooldown active');
+        primaryError.status = 429;
+      } else {
+        try {
+          const payload = await fetchWeather();
+
+          if (!isUsableWeatherPayload(payload)) {
+            const error = new Error(
+              'Open-Meteo returned no usable weather data'
+            );
+            error.code = 'EMPTY_WEATHER';
+            throw error;
+          }
+
+          const record = await storeWeather(payload);
+          primaryRateLimitedUntil = 0;
+          return { record, rateLimited: false, retryAt: 0 };
+        } catch (error) {
+          primaryError = error;
+          primaryRateLimited = error?.status === 429;
+
+          if (primaryRateLimited) {
+            primaryRateLimitedUntil = activateRateLimit(
+              error,
+              primaryRateLimitedUntil,
+              'Open-Meteo'
+            );
+          }
+
+          console.error(
+            '[weather] Live fetch failed:',
+            safeFailureReason(error)
+          );
+
+          if (isPermanentProviderFailure(error)) {
+            return { error, rateLimited: false, retryAt: 0 };
+          }
+        }
       }
 
-      const fetchedAt = Date.now();
-      const record = {
-        ...payload,
-        fetchedAt: new Date(fetchedAt).toISOString(),
-      };
+      const apiKey = weatherApiKey();
+      if (!apiKey) {
+        return {
+          error: primaryError,
+          rateLimited: primaryRateLimited,
+          retryAt: primaryRateLimited ? primaryRateLimitedUntil : 0,
+        };
+      }
 
-      cache = { fetchedAt, payload: record };
-      rateLimitedUntil = 0;
+      if (Date.now() < secondaryRateLimitedUntil) {
+        return {
+          error: primaryError,
+          rateLimited: true,
+          retryAt: earliestFutureRateLimit(
+            primaryRateLimitedUntil,
+            secondaryRateLimitedUntil
+          ),
+        };
+      }
 
       try {
-        await persistWeather(record);
+        const payload = await fetchWeatherApiWeather(apiKey);
+
+        if (!isUsableWeatherPayload(payload)) {
+          const error = new Error(
+            'WeatherAPI.com returned no usable weather data'
+          );
+          error.code = 'EMPTY_WEATHER';
+          throw error;
+        }
+
+        const record = await storeWeather(payload);
+        secondaryRateLimitedUntil = 0;
+        return { record, rateLimited: false, retryAt: 0 };
       } catch (error) {
+        const secondaryRateLimited = error?.status === 429;
+
+        if (secondaryRateLimited) {
+          secondaryRateLimitedUntil = activateRateLimit(
+            error,
+            secondaryRateLimitedUntil,
+            'WeatherAPI.com'
+          );
+        }
+
         console.error(
-          '[weather] Persistent cache write failed:',
-          error?.message || 'unknown error'
+          '[weather] Secondary fetch failed:',
+          safeFailureReason(error)
         );
+
+        return {
+          error,
+          rateLimited: primaryRateLimited || secondaryRateLimited,
+          retryAt: earliestFutureRateLimit(
+            primaryRateLimited ? primaryRateLimitedUntil : 0,
+            secondaryRateLimited ? secondaryRateLimitedUntil : 0
+          ),
+        };
       }
-
-      return { record, rateLimited: false };
-    } catch (error) {
-      const rateLimited = error?.status === 429;
-      const now = Date.now();
-
-      if (rateLimited) {
-        const delay = retryAfterMs(error.retryAfter, now);
-        rateLimitedUntil = Math.max(rateLimitedUntil, now + delay);
-
-        console.warn(
-          `[weather] Provider rate limit active for ${Math.ceil(
-            Math.max(0, rateLimitedUntil - now) / 1000
-          )}s`
-        );
-      }
-
-      let reason = error?.cause?.code || error?.message || 'unknown error';
-      if (rateLimited) reason = 'HTTP 429';
-      else if (error?.status) reason = `HTTP ${error.status}`;
-
-      console.error('[weather] Live fetch failed:', reason);
-
-      return { error, rateLimited };
     } finally {
       inFlight = null;
     }
@@ -614,7 +1152,8 @@ function loadWeather() {
   return inFlight;
 }
 
-// PUBLIC: Current weather for Kombolcha, sourced from Open-Meteo (no API key).
+// PUBLIC: Current weather for Kombolcha. Open-Meteo is primary; WeatherAPI.com
+// is used only after a temporary primary failure, and only when configured.
 router.get(
   '/',
   asyncRoute(async (_req, res) => {
@@ -644,10 +1183,6 @@ router.get(
       }
     }
 
-    if (now < rateLimitedUntil) {
-      return sendWeatherFallback(res, now, true);
-    }
-
     const result = await loadWeather();
 
     if (result.record) {
@@ -657,7 +1192,10 @@ router.get(
       });
     }
 
-    return sendWeatherFallback(res, Date.now(), result.rateLimited);
+    return sendWeatherFallback(res, Date.now(), {
+      rateLimited: result.rateLimited,
+      retryAt: result.retryAt,
+    });
   })
 );
 
