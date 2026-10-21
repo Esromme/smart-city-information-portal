@@ -1,11 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 
+const { mockQuery } = vi.hoisted(() => ({
+  mockQuery: vi.fn(),
+}));
+
+vi.mock('../db.js', () => ({ query: mockQuery, pool: {} }));
+
 const { buildApp } = await import('../test/buildApp.js');
 const {
   default: weather,
   resetWeatherCache,
   WEATHER_CACHE_TTL_MS,
+  WEATHER_PERSISTENCE_RETRY_MS,
+  WEATHER_PERSISTENCE_TIMEOUT_MS,
   WEATHER_STALE_TTL_MS,
 } = await import('./weather.js');
 
@@ -86,6 +94,109 @@ function minimalResponse() {
   };
 }
 
+function persistedWeather(overrides = {}) {
+  return {
+    location: 'Kombolcha, Ethiopia',
+    latitude: 11.07,
+    longitude: 39.77,
+    timezone: 'Africa/Addis_Ababa',
+    observedAt: '2026-10-19T17:15+03:00',
+    temperatureC: 19.4,
+    apparentC: 19,
+    humidity: 45,
+    precipitationMm: 0,
+    windKph: 7,
+    windDirectionDeg: 90,
+    weatherCode: 2,
+    description: 'Partly cloudy',
+    today: {
+      maxC: 24,
+      minC: 12,
+      precipitationProbabilityMax: 20,
+    },
+    isDay: true,
+    dewPointC: 7,
+    uvIndex: 3,
+    visibilityKm: 18,
+    sunrise: '2026-10-19T06:12',
+    sunset: '2026-10-19T18:04',
+    hourly: [],
+    daily: [],
+    source: {
+      name: 'Open-Meteo',
+      url: 'https://open-meteo.com/',
+      license: 'CC BY 4.0',
+      attribution: 'Weather data by Open-Meteo.com',
+    },
+    ...overrides,
+  };
+}
+
+function persistedRow(payload, fetchedAt) {
+  return {
+    rows: [
+      {
+        payload,
+        fetched_at: new Date(fetchedAt).toISOString(),
+      },
+    ],
+  };
+}
+
+// The route sends pg a config object so it can attach query_timeout. Keep the
+// existing assertions readable while supporting that shape.
+function queryConfig(call) {
+  if (!Array.isArray(call)) return call;
+  const [first, second] = call;
+  return typeof first === 'string'
+    ? { text: first, values: second }
+    : first;
+}
+
+function queryText(call) {
+  return queryConfig(call).text;
+}
+
+function queryValues(call) {
+  return queryConfig(call).values ?? [];
+}
+
+function persistenceWrites() {
+  return mockQuery.mock.calls.filter((call) =>
+    /insert into public\.weather_cache/i.test(queryText(call))
+  );
+}
+
+function expectNoPersistenceWrite() {
+  expect(persistenceWrites()).toHaveLength(0);
+}
+
+// Small in-memory stand-in for the conditional PostgreSQL upsert. The route
+// still owns the real SQL predicate; this lets the tests prove that an older
+// incoming timestamp does not replace a newer stored row.
+function installPersistedStore(payload, fetchedAt) {
+  const state = { payload, fetchedAt };
+
+  mockQuery.mockImplementation(async (call) => {
+    const sql = queryText(call);
+    if (/from public\.weather_cache/i.test(sql)) {
+      return persistedRow(state.payload, state.fetchedAt);
+    }
+    if (/insert into public\.weather_cache/i.test(sql)) {
+      const values = queryValues(call);
+      const incomingAt = new Date(values[2]).getTime();
+      if (incomingAt > state.fetchedAt) {
+        state.payload = JSON.parse(values[1]);
+        state.fetchedAt = incomingAt;
+      }
+      return { rows: [] };
+    }
+    return { rows: [] };
+  });
+
+  return state;
+}
+
 function mockProvider(payload) {
   const fetchMock = vi.fn().mockResolvedValue({
     ok: true,
@@ -125,6 +236,8 @@ function deferredProvider(payload = openMeteoResponse()) {
 }
 
 beforeEach(() => {
+  mockQuery.mockReset();
+  mockQuery.mockResolvedValue({ rows: [] });
   resetWeatherCache();
 });
 
@@ -218,6 +331,61 @@ describe('GET /weather', () => {
     expect(data.isDay).toBeNull();
   });
 
+  it('accepts a live zero reading', async () => {
+    const payload = minimalResponse();
+    payload.current.temperature_2m = 0;
+    payload.current.apparent_temperature = 0;
+    payload.current.relative_humidity_2m = 0;
+    payload.current.weather_code = 0;
+    payload.daily.temperature_2m_max = [0];
+    payload.daily.temperature_2m_min = [0];
+    payload.daily.precipitation_probability_max = [0];
+
+    mockProvider(payload);
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.temperatureC).toBe(0);
+    expect(response.body.data.weatherCode).toBe(0);
+    expect(response.body.data.today.maxC).toBe(0);
+  });
+
+  it('accepts a zero reading inside a supplied hourly block', async () => {
+    const payload = openMeteoResponse();
+    payload.current = {
+      time: '2026-10-19T17:15',
+      temperature_2m: null,
+      apparent_temperature: null,
+      relative_humidity_2m: null,
+      precipitation: null,
+      weather_code: null,
+      wind_speed_10m: null,
+      wind_direction_10m: null,
+      is_day: null,
+    };
+    payload.hourly = {
+      time: ['2026-10-19T17:00'],
+      temperature_2m: [0],
+      weather_code: [0],
+      precipitation_probability: [0],
+      is_day: [0],
+      wind_speed_10m: [0],
+      uv_index: [0],
+      visibility: [0],
+      dew_point_2m: [0],
+    };
+    payload.daily = undefined;
+
+    mockProvider(payload);
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.temperatureC).toBeNull();
+    expect(response.body.data.hourly[0].temperatureC).toBe(0);
+    expect(response.body.data.hourly[0].weatherCode).toBe(0);
+    expect(response.body.data.hourly[0].precipitationProbability).toBe(0);
+  });
+
   it('serves a cached reading without calling the provider again', async () => {
     const fetchMock = mockProvider(openMeteoResponse());
 
@@ -227,6 +395,672 @@ describe('GET /weather', () => {
     expect(second.body.cached).toBe(true);
     expect(second.body.data.stale).toBe(false);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not query PostgreSQL when the in-memory cache is fresh', async () => {
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    await request(app).get('/');
+    mockQuery.mockClear();
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(true);
+    expect(second.body.data.stale).toBe(false);
+    expect(mockQuery).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes the pg per-query timeout to persistence calls', async () => {
+    mockProvider(openMeteoResponse());
+
+    await request(app).get('/');
+
+    expect(mockQuery).toHaveBeenCalled();
+    for (const [config] of mockQuery.mock.calls) {
+      expect(config.query_timeout).toBe(WEATHER_PERSISTENCE_TIMEOUT_MS);
+    }
+  });
+
+  it('persists a successful provider response', async () => {
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    await request(app).get('/');
+
+    const insertCall = mockQuery.mock.calls.find((call) =>
+      /insert into public\.weather_cache/i.test(queryText(call))
+    );
+
+    expect(insertCall).toBeDefined();
+    const params = queryValues(insertCall);
+    const stored = JSON.parse(params[1]);
+
+    expect(params[0]).toMatch(/^open-meteo:v1:/);
+    expect(stored.temperatureC).toBe(22.9);
+    expect(stored.fetchedAt).toBe(params[2]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves persistent cache after the in-memory cache is reset', async () => {
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    await request(app).get('/');
+
+    const insertCall = mockQuery.mock.calls.find((call) =>
+      /insert into public\.weather_cache/i.test(queryText(call))
+    );
+    const stored = JSON.parse(queryValues(insertCall)[1]);
+    const fetchedAt = queryValues(insertCall)[2];
+
+    resetWeatherCache();
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        return persistedRow(stored, fetchedAt);
+      }
+      return { rows: [] };
+    });
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(true);
+    expect(second.body.data.stale).toBe(false);
+    expect(second.body.data.temperatureC).toBe(22.9);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('repairs a rejected persisted row with a successful live response', async () => {
+    const now = 1_700_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    let persisted = persistedRow(
+      persistedWeather({ hourly: 'not-an-array' }),
+      now - 60 * 1000
+    );
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) return persisted;
+      return { rows: [] };
+    });
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(200);
+    expect(first.body.cached).toBe(false);
+    expect(first.body.data.temperatureC).toBe(22.9);
+
+    const insertCall = mockQuery.mock.calls.find((call) =>
+      /insert into public\.weather_cache/i.test(queryText(call))
+    );
+
+    expect(insertCall).toBeDefined();
+    const stored = JSON.parse(queryValues(insertCall)[1]);
+    const fetchedAt = queryValues(insertCall)[2];
+    expect(stored.temperatureC).toBe(22.9);
+
+    // Simulate another process reading the row written by the live repair.
+    resetWeatherCache();
+    persisted = persistedRow(stored, fetchedAt);
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(true);
+    expect(second.body.data.temperatureC).toBe(22.9);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses a newer persisted row when the in-memory entry is stale', async () => {
+    const t0 = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    await request(app).get('/');
+
+    const insertCall = mockQuery.mock.calls.find((call) =>
+      /insert into public\.weather_cache/i.test(queryText(call))
+    );
+    const stored = JSON.parse(queryValues(insertCall)[1]);
+    const refreshed = {
+      ...stored,
+      temperatureC: 30.1,
+      fetchedAt: new Date(t0 + 15 * 60 * 1000).toISOString(),
+    };
+
+    nowSpy.mockReturnValue(t0 + 16 * 60 * 1000);
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        return persistedRow(refreshed, t0 + 15 * 60 * 1000);
+      }
+      return { rows: [] };
+    });
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(true);
+    expect(second.body.data.stale).toBe(false);
+    expect(second.body.data.temperatureC).toBe(30.1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows a newer live reading to replace an older persisted row', async () => {
+    const t0 = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+    const oldAt = t0 - WEATHER_CACHE_TTL_MS - 60 * 1000;
+    const persisted = installPersistedStore(persistedWeather(), oldAt);
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(200);
+    expect(first.body.cached).toBe(false);
+    expect(first.body.data.temperatureC).toBe(22.9);
+    expect(persisted.fetchedAt).toBe(t0);
+    expect(persisted.payload.temperatureC).toBe(22.9);
+
+    expect(persistenceWrites()).toHaveLength(1);
+    expect(queryText(persistenceWrites()[0])).toMatch(
+      /where excluded\.fetched_at > weather_cache\.fetched_at/i
+    );
+
+    resetWeatherCache();
+    nowSpy.mockReturnValue(t0 + 60 * 1000);
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(true);
+    expect(second.body.data.temperatureC).toBe(22.9);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let an older live reading replace a newer persisted row', async () => {
+    const t0 = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+    const newerAt = t0 + 5 * 60 * 1000;
+    const persisted = installPersistedStore(persistedWeather(), newerAt);
+    const fetchMock = mockProvider(openMeteoResponse());
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(200);
+    expect(first.body.cached).toBe(false);
+    expect(first.body.data.temperatureC).toBe(22.9);
+    expect(persisted.fetchedAt).toBe(newerAt);
+    expect(persisted.payload.temperatureC).toBe(19.4);
+
+    expect(persistenceWrites()).toHaveLength(1);
+    expect(queryText(persistenceWrites()[0])).toMatch(
+      /where excluded\.fetched_at > weather_cache\.fetched_at/i
+    );
+
+    resetWeatherCache();
+    nowSpy.mockReturnValue(t0 + 6 * 60 * 1000);
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(true);
+    expect(second.body.data.temperatureC).toBe(19.4);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves a persisted reading at exactly six hours after a provider failure', async () => {
+    const realNow = 1_700_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(realNow);
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
+
+    const staleAt = realNow - WEATHER_STALE_TTL_MS;
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        return persistedRow(persistedWeather(), staleAt);
+      }
+      return { rows: [] };
+    });
+
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(200);
+    expect(response.body.cached).toBe(true);
+    expect(response.body.data.stale).toBe(true);
+    expect(response.body.data.temperatureC).toBe(19.4);
+    expect(response.body.warning).toMatch(/last successful reading/);
+  });
+
+  it('serves persisted stale data and honors Retry-After on 429', async () => {
+    const realNow = 1_700_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(realNow);
+    const fetchMock = mockRateLimit('90');
+
+    const staleAt = realNow - WEATHER_CACHE_TTL_MS - 60 * 1000;
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        return persistedRow(persistedWeather(), staleAt);
+      }
+      return { rows: [] };
+    });
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(200);
+    expect(first.body.cached).toBe(true);
+    expect(first.body.data.stale).toBe(true);
+    expect(first.headers['retry-after']).toBe('90');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.data.stale).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['future-dated', 60 * 1000],
+    ['older than six hours', -WEATHER_STALE_TTL_MS - 1],
+  ])('rejects a %s persisted row', async (_label, offset) => {
+    const now = 1_700_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        return persistedRow(persistedWeather(), now + offset);
+      }
+      return { rows: [] };
+    });
+
+    const fetchMock = vi.fn().mockRejectedValue(new Error('provider offline'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(502);
+    expect(response.body.data).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [
+      'a numeric-string current reading',
+      persistedWeather({
+        temperatureC: '19.4',
+        apparentC: null,
+        humidity: null,
+        weatherCode: null,
+      }),
+    ],
+    [
+      'a forecast with no finite readings',
+      persistedWeather({
+        temperatureC: null,
+        apparentC: null,
+        humidity: null,
+        weatherCode: null,
+        hourly: [
+          {
+            time: '2026-10-19T17:00',
+            temperatureC: null,
+            weatherCode: null,
+            precipitationProbability: null,
+            windKph: null,
+          },
+        ],
+      }),
+    ],
+    [
+      'a malformed hourly block',
+      persistedWeather({ hourly: 'not-an-array' }),
+    ],
+    [
+      'a supplied all-null hourly block with a valid current reading',
+      persistedWeather({
+        hourly: [
+          {
+            time: '2026-10-19T17:00',
+            temperatureC: null,
+            weatherCode: null,
+            precipitationProbability: null,
+            windKph: null,
+          },
+        ],
+      }),
+    ],
+    [
+      'a supplied all-null daily block with a valid current reading',
+      persistedWeather({
+        daily: [
+          {
+            date: '2026-10-19',
+            maxC: null,
+            minC: null,
+            weatherCode: null,
+            precipitationProbabilityMax: null,
+            precipitationMm: null,
+            uvIndexMax: null,
+            windKphMax: null,
+          },
+        ],
+      }),
+    ],
+  ])('rejects a persisted payload with %s', async (_label, payload) => {
+    const now = 1_700_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        return persistedRow(payload, now - 60 * 1000);
+      }
+      return { rows: [] };
+    });
+
+    const fetchMock = vi.fn().mockRejectedValue(new Error('provider offline'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(502);
+    expect(response.body.data).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts a persisted zero reading', async () => {
+    const now = 1_700_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        return persistedRow(
+          persistedWeather({
+            temperatureC: 0,
+            apparentC: 0,
+            humidity: 0,
+            weatherCode: 0,
+          }),
+          now - 60 * 1000
+        );
+      }
+      return { rows: [] };
+    });
+
+    const fetchMock = mockProvider(openMeteoResponse());
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(200);
+    expect(response.body.cached).toBe(true);
+    expect(response.body.data.stale).toBe(false);
+    expect(response.body.data.temperatureC).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('returns live weather when the persistent cache read fails', async () => {
+    mockProvider(openMeteoResponse());
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        throw new Error('read failed');
+      }
+      return { rows: [] };
+    });
+
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(200);
+    expect(response.body.cached).toBe(false);
+    expect(response.body.data.temperatureC).toBe(22.9);
+  });
+
+  it('returns live weather when the persistent cache write fails', async () => {
+    mockProvider(openMeteoResponse());
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        return { rows: [] };
+      }
+      throw new Error('write failed');
+    });
+
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(200);
+    expect(response.body.cached).toBe(false);
+    expect(response.body.data.temperatureC).toBe(22.9);
+  });
+
+  it('suppresses repeated database reads after a failure and keeps live weather available', async () => {
+    const now = 1_700_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+
+    let readCalls = 0;
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        readCalls += 1;
+        throw new Error('read failed');
+      }
+      return { rows: [] };
+    });
+
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('provider offline'))
+      .mockResolvedValue({
+        ok: true,
+        json: async () => openMeteoResponse(),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const first = await request(app).get('/');
+    expect(first.status).toBe(502);
+
+    const second = await request(app).get('/');
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(false);
+    expect(readCalls).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('resumes a suppressed database read at the 60-second boundary', async () => {
+    const t0 = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+
+    let readCalls = 0;
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        readCalls += 1;
+        throw new Error('read failed');
+      }
+      return { rows: [] };
+    });
+
+    const fetchMock = vi.fn().mockRejectedValue(new Error('provider offline'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await request(app).get('/');
+
+    nowSpy.mockReturnValue(t0 + WEATHER_PERSISTENCE_RETRY_MS - 1);
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(502);
+    expect(readCalls).toBe(1);
+
+    nowSpy.mockReturnValue(t0 + WEATHER_PERSISTENCE_RETRY_MS);
+    const third = await request(app).get('/');
+
+    expect(third.status).toBe(502);
+    expect(readCalls).toBe(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps serving stale fallback while database reads are suppressed', async () => {
+    const t0 = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+
+    let readCalls = 0;
+    mockQuery.mockImplementation(async (call) => {
+      const sql = queryText(call);
+      if (/from public\.weather_cache/i.test(sql)) {
+        readCalls += 1;
+        if (readCalls === 1) return { rows: [] };
+        throw new Error('read failed');
+      }
+      return { rows: [] };
+    });
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => openMeteoResponse(),
+      })
+      .mockRejectedValue(new Error('provider offline'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const first = await request(app).get('/');
+    expect(first.status).toBe(200);
+
+    nowSpy.mockReturnValue(t0 + WEATHER_CACHE_TTL_MS + 60 * 1000);
+
+    const second = await request(app).get('/');
+    expect(second.status).toBe(200);
+    expect(second.body.cached).toBe(true);
+    expect(second.body.data.stale).toBe(true);
+
+    const third = await request(app).get('/');
+    expect(third.status).toBe(200);
+    expect(third.body.data.stale).toBe(true);
+    expect(readCalls).toBe(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not turn an empty provider response into a successful forecast', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({}),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(502);
+    expect(response.body.data).toBeUndefined();
+    expectNoPersistenceWrite();
+
+    const second = await request(app).get('/');
+    expect(second.status).toBe(502);
+    expectNoPersistenceWrite();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a provider response with timestamps but no finite readings', async () => {
+    const fetchMock = mockProvider({
+      latitude: 11.07,
+      longitude: 39.77,
+      timezone: 'Africa/Addis_Ababa',
+      utc_offset_seconds: 10800,
+      current: { time: '2026-10-19T17:15' },
+      hourly: {
+        time: ['2026-10-19T17:00'],
+        temperature_2m: ['n/a'],
+        weather_code: [null],
+        precipitation_probability: [null],
+        is_day: [null],
+        wind_speed_10m: [null],
+        uv_index: [null],
+        visibility: [null],
+        dew_point_2m: [null],
+      },
+      daily: {
+        time: ['2026-10-19'],
+        temperature_2m_max: ['n/a'],
+        temperature_2m_min: [null],
+        precipitation_probability_max: [null],
+        weather_code: [null],
+        sunrise: [null],
+        sunset: [null],
+        uv_index_max: [null],
+        precipitation_sum: [null],
+        wind_speed_10m_max: [null],
+      },
+    });
+
+    const response = await request(app).get('/');
+
+    expect(response.status).toBe(502);
+    expect(response.body.data).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expectNoPersistenceWrite();
+  });
+
+  it('rejects a supplied all-null hourly block even when current is valid', async () => {
+    const fetchMock = mockProvider({
+      ...openMeteoResponse(),
+      hourly: {
+        time: ['2026-10-19T17:00'],
+        temperature_2m: [null],
+        weather_code: [null],
+        precipitation_probability: [null],
+        is_day: [null],
+        wind_speed_10m: [null],
+        uv_index: [null],
+        visibility: [null],
+        dew_point_2m: [null],
+      },
+      daily: undefined,
+    });
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(502);
+    expect(first.body.data).toBeUndefined();
+    expectNoPersistenceWrite();
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(502);
+    expect(second.body.data).toBeUndefined();
+    expectNoPersistenceWrite();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a supplied all-null daily block even when current is valid', async () => {
+    const fetchMock = mockProvider({
+      ...openMeteoResponse(),
+      hourly: undefined,
+      daily: {
+        time: ['2026-10-19'],
+        temperature_2m_max: [null],
+        temperature_2m_min: [null],
+        precipitation_probability_max: [null],
+        weather_code: [null],
+        sunrise: [null],
+        sunset: [null],
+        uv_index_max: [null],
+        precipitation_sum: [null],
+        wind_speed_10m_max: [null],
+      },
+    });
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(502);
+    expect(first.body.data).toBeUndefined();
+    expectNoPersistenceWrite();
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(502);
+    expect(second.body.data).toBeUndefined();
+    expectNoPersistenceWrite();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('refetches after the 15-minute cache window', async () => {
@@ -293,21 +1127,28 @@ describe('GET /weather', () => {
     expect(response.body.warning).toMatch(/last successful reading/);
   });
 
-  it('stops serving stale data after 6 hours', async () => {
+  it('serves stale data at exactly six hours and stops after that', async () => {
+    const t0 = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
     const fetchMock = mockProvider(openMeteoResponse());
 
     await request(app).get('/');
 
-    const realNow = Date.now();
-    vi.spyOn(Date, 'now').mockReturnValue(
-      realNow + WEATHER_STALE_TTL_MS + 1
-    );
+    nowSpy.mockReturnValue(t0 + WEATHER_STALE_TTL_MS);
     fetchMock.mockRejectedValue(new Error('offline'));
 
-    const response = await request(app).get('/');
+    const atLimit = await request(app).get('/');
 
-    expect(response.status).toBe(502);
-    expect(response.body.data).toBeUndefined();
+    expect(atLimit.status).toBe(200);
+    expect(atLimit.body.cached).toBe(true);
+    expect(atLimit.body.data.stale).toBe(true);
+
+    nowSpy.mockReturnValue(t0 + WEATHER_STALE_TTL_MS + 1);
+    const pastLimit = await request(app).get('/');
+
+    expect(pastLimit.status).toBe(502);
+    expect(pastLimit.body.data).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it('returns 503 and honors Retry-After when rate-limited without a cache', async () => {
@@ -324,6 +1165,23 @@ describe('GET /weather', () => {
     const second = await request(app).get('/');
 
     expect(second.status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors an HTTP-date Retry-After', async () => {
+    const now = Date.parse('2026-10-21T07:27:00Z');
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const fetchMock = mockRateLimit(new Date(now + 90 * 1000).toUTCString());
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(503);
+    expect(first.headers['retry-after']).toBe('90');
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(503);
+    expect(second.headers['retry-after']).toBe('90');
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
