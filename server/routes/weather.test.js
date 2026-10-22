@@ -1551,6 +1551,78 @@ describe('WeatherAPI secondary provider', () => {
     });
   });
 
+  it('skips the primary during the default 60-second cooldown and retries WeatherAPI', async () => {
+    const t0 = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+    process.env.WEATHERAPI_API_KEY = 'dummy-weatherapi-key';
+
+    let secondaryAttempts = 0;
+    const fetchMock = mockWeatherProviders({
+      primary: () => failedResponse(429),
+      secondary: () => {
+        secondaryAttempts += 1;
+        return secondaryAttempts === 1
+          ? failedResponse(500)
+          : okResponse(weatherApiResponse());
+      },
+    });
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(503);
+    expect(providerCalls(fetchMock)).toMatchObject({
+      primary: 1,
+      secondary: 1,
+    });
+
+    nowSpy.mockReturnValue(t0 + 1000);
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.data.source.name).toBe('WeatherAPI.com');
+    expect(providerCalls(fetchMock)).toMatchObject({
+      primary: 1,
+      secondary: 2,
+    });
+  });
+
+  it('keeps the 60-second primary cooldown when Retry-After is zero', async () => {
+    const t0 = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+    process.env.WEATHERAPI_API_KEY = 'dummy-weatherapi-key';
+
+    let secondaryAttempts = 0;
+    const fetchMock = mockWeatherProviders({
+      primary: () => failedResponse(429, '0'),
+      secondary: () => {
+        secondaryAttempts += 1;
+        return secondaryAttempts === 1
+          ? failedResponse(500)
+          : okResponse(weatherApiResponse());
+      },
+    });
+
+    const first = await request(app).get('/');
+
+    expect(first.status).toBe(503);
+    expect(providerCalls(fetchMock)).toMatchObject({
+      primary: 1,
+      secondary: 1,
+    });
+
+    nowSpy.mockReturnValue(t0 + 1000);
+
+    const second = await request(app).get('/');
+
+    expect(second.status).toBe(200);
+    expect(second.body.data.source.name).toBe('WeatherAPI.com');
+    expect(providerCalls(fetchMock)).toMatchObject({
+      primary: 1,
+      secondary: 2,
+    });
+  });
+
   it('does not try WeatherAPI after a permanent Open-Meteo failure', async () => {
     process.env.WEATHERAPI_API_KEY = 'dummy-weatherapi-key';
     const fetchMock = mockWeatherProviders({

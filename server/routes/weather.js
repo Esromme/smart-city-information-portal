@@ -178,6 +178,10 @@ function safeFailureReason(error) {
   return 'network error';
 }
 
+function isRateLimitedError(error) {
+  return Number(error?.status) === 429;
+}
+
 function isPermanentProviderFailure(error) {
   const status = Number(error?.status);
   if (!Number.isFinite(status)) return false;
@@ -1014,7 +1018,13 @@ async function storeWeather(payload) {
 
 function activateRateLimit(error, currentUntil, provider) {
   const now = Date.now();
-  const delay = retryAfterMs(error?.retryAfter, now);
+  // A provider can omit Retry-After or send a non-positive/expired value. Keep
+  // the existing 60-second cooldown floor so a 429 always suppresses that
+  // provider for at least the normal retry window.
+  const delay = Math.max(
+    RATE_LIMIT_FALLBACK_MS,
+    retryAfterMs(error?.retryAfter, now)
+  );
   const until = Math.max(currentUntil, now + delay);
 
   console.warn(
@@ -1064,7 +1074,7 @@ function loadWeather() {
           return { record, rateLimited: false, retryAt: 0 };
         } catch (error) {
           primaryError = error;
-          primaryRateLimited = error?.status === 429;
+          primaryRateLimited = isRateLimitedError(error);
 
           if (primaryRateLimited) {
             primaryRateLimitedUntil = activateRateLimit(
@@ -1120,7 +1130,7 @@ function loadWeather() {
         secondaryRateLimitedUntil = 0;
         return { record, rateLimited: false, retryAt: 0 };
       } catch (error) {
-        const secondaryRateLimited = error?.status === 429;
+        const secondaryRateLimited = isRateLimitedError(error);
 
         if (secondaryRateLimited) {
           secondaryRateLimitedUntil = activateRateLimit(
